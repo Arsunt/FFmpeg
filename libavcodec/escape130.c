@@ -34,9 +34,10 @@ typedef struct Escape130Context {
     uint8_t *new_y, *old_y;
     uint8_t *new_u, *old_u;
     uint8_t *new_v, *old_v;
+    uint8_t *new_f, *old_f;
 
     uint8_t *buf1, *buf2;
-    int     linesize[3];
+    int     linesize[4];
 } Escape130Context;
 
 // Header flags definition
@@ -119,6 +120,16 @@ static const uint8_t chroma_vals[] = {
     172, 180, 188, 196, 204, 212, 220, 228
 };
 
+/*
+ * The original decoder applies the pattern to blocks
+ * that have solid Y after YUV->RGB conversion 
+ * The purpose of this action is to reduce blockiness.
+ */
+static const int8_t rgb_pattern[2][2][3] = {
+    {{0, 6, 0}, {6, 0, 6}},
+    {{4, 2, 4}, {2, 4, 2}},
+};
+
 static int16_t cb2rgb[2][32][3];
 static int16_t cr2rgb[2][32][3];
 
@@ -162,8 +173,8 @@ static av_cold int escape130_decode_init(AVCodecContext *avctx)
     }
 
     s->old_y_avg = av_malloc(avctx->width * avctx->height / 4);
-    s->buf1      = av_malloc(avctx->width * avctx->height * 3 / 2);
-    s->buf2      = av_malloc(avctx->width * avctx->height * 3 / 2);
+    s->buf1      = av_malloc(avctx->width * avctx->height * 7 / 4);
+    s->buf2      = av_malloc(avctx->width * avctx->height * 7 / 4);
     if (!s->old_y_avg || !s->buf1 || !s->buf2) {
         av_freep(&s->old_y_avg);
         av_freep(&s->buf1);
@@ -174,17 +185,21 @@ static av_cold int escape130_decode_init(AVCodecContext *avctx)
 
     s->linesize[0] = avctx->width;
     s->linesize[1] =
-    s->linesize[2] = avctx->width / 2;
+    s->linesize[2] =
+    s->linesize[3] = avctx->width / 2;
 
     s->new_y = s->buf1;
     s->new_u = s->new_y + avctx->width * avctx->height;
     s->new_v = s->new_u + avctx->width * avctx->height / 4;
+    s->new_f = s->new_v + avctx->width * avctx->height / 4;
     s->old_y = s->buf2;
     s->old_u = s->old_y + avctx->width * avctx->height;
     s->old_v = s->old_u + avctx->width * avctx->height / 4;
+    s->old_f = s->old_v + avctx->width * avctx->height / 4;
     memset(s->old_y, 0,    avctx->width * avctx->height);
     memset(s->old_u, 0x10, avctx->width * avctx->height / 4);
     memset(s->old_v, 0x10, avctx->width * avctx->height / 4);
+    memset(s->old_f, 0,    avctx->width * avctx->height / 4);
 
     generate_chroma2rgb();
 
@@ -238,14 +253,14 @@ static int escape130_decode_frame(AVCodecContext *avctx, void *data,
     unsigned frame_flags, frame_size;
     int ret;
 
-    uint8_t *old_y, *old_cb, *old_cr,
-            *new_y, *new_cb, *new_cr;
+    uint8_t *old_y, *old_cb, *old_cr, *old_f,
+            *new_y, *new_cb, *new_cr, *new_f;
     uint8_t *dst_line, *dst_rgb;
-    unsigned old_y_stride, old_cb_stride, old_cr_stride,
-             new_y_stride, new_cb_stride, new_cr_stride;
+    unsigned old_y_stride, old_cb_stride, old_cr_stride, old_f_stride,
+             new_y_stride, new_cb_stride, new_cr_stride, new_f_stride;
     unsigned total_blocks = avctx->width * avctx->height / 4,
              block_index, block_x = 0;
-    unsigned y[4] = { 0 }, cb = 0x10, cr = 0x10;
+    unsigned y[4] = { 0 }, cb = 0x10, cr = 0x10, f = 0;
     int skip = -1, chroma_mode = 0, y_avg = 0, r, g, b, i, j, m, n;
     uint8_t *ya = s->old_y_avg;
 
@@ -281,15 +296,19 @@ static int escape130_decode_frame(AVCodecContext *avctx, void *data,
     new_y  = s->new_y;
     new_cb = s->new_u;
     new_cr = s->new_v;
+    new_f  = s->new_f;
     new_y_stride  = s->linesize[0];
     new_cb_stride = s->linesize[1];
     new_cr_stride = s->linesize[2];
+    new_f_stride  = s->linesize[3];
     old_y  = s->old_y;
     old_cb = s->old_u;
     old_cr = s->old_v;
+    old_f  = s->old_f;
     old_y_stride  = s->linesize[0];
     old_cb_stride = s->linesize[1];
     old_cr_stride = s->linesize[2];
+    old_f_stride  = s->linesize[3];
 
     for (block_index = 0; block_index < total_blocks; block_index++) {
         // Note that this call will make us skip the rest of the blocks
@@ -309,11 +328,13 @@ static int escape130_decode_frame(AVCodecContext *avctx, void *data,
             y_avg = ya[0];
             cb = old_cb[0];
             cr = old_cr[0];
+            f = old_f[0];
         } else {
             if (get_bits1(&gb)) {
                 unsigned sign_selector       = get_bits(&gb, 6);
                 unsigned difference_selector = get_bits(&gb, 2);
                 y_avg = 2 * get_bits(&gb, 5);
+                f = 1;
                 for (i = 0; i < 4; i++) {
                     y[i] = av_clip(y_avg + offset_table[difference_selector] *
                                    sign_table[sign_selector][i], 0, 63);
@@ -327,6 +348,7 @@ static int escape130_decode_frame(AVCodecContext *avctx, void *data,
                         y_avg = (y_avg + luma_adjust[adjust_index]) & 63;
                     }
                 }
+                f = 0;
                 for (i = 0; i < 4; i++)
                     y[i] = y_avg;
             }
@@ -350,22 +372,27 @@ static int escape130_decode_frame(AVCodecContext *avctx, void *data,
         new_y[new_y_stride + 1] = y[3];
         *new_cb = cb;
         *new_cr = cr;
+        *new_f = f;
 
         old_y += 2;
         old_cb++;
         old_cr++;
+        old_f++;
         new_y += 2;
         new_cb++;
         new_cr++;
+        new_f++;
         block_x++;
         if (block_x * 2 == avctx->width) {
             block_x = 0;
             old_y  += old_y_stride * 2  - avctx->width;
             old_cb += old_cb_stride     - avctx->width / 2;
             old_cr += old_cr_stride     - avctx->width / 2;
+            old_f  += old_f_stride      - avctx->width / 2;
             new_y  += new_y_stride * 2  - avctx->width;
             new_cb += new_cb_stride     - avctx->width / 2;
             new_cr += new_cr_stride     - avctx->width / 2;
+            new_f  += new_f_stride      - avctx->width / 2;
         }
 
         skip--;
@@ -374,6 +401,7 @@ static int escape130_decode_frame(AVCodecContext *avctx, void *data,
     new_y  = s->new_y;
     new_cb = s->new_u;
     new_cr = s->new_v;
+    new_f  = s->new_f;
     dst_line = pic->data[0];
 
     for (j = 0; j < avctx->height / 2; j++) {
@@ -390,6 +418,13 @@ static int escape130_decode_frame(AVCodecContext *avctx, void *data,
                         cb2rgb[chroma_mode][new_cb[i]][2] +
                         cr2rgb[chroma_mode][new_cr[i]][2];
 
+                    // if Y pattern has not been applied, add rgb pattern here
+                    if( new_f[i] == 0 ) {
+                        r += rgb_pattern[m][n][0];
+                        g += rgb_pattern[m][n][1];
+                        b += rgb_pattern[m][n][2];
+                    }
+
                     dst_rgb = dst_line + i * 6 + m * pic->linesize[0] + n * 3;
 
                     dst_rgb[0] = av_clip(r, 0, 255);
@@ -402,6 +437,7 @@ static int escape130_decode_frame(AVCodecContext *avctx, void *data,
         new_y  += new_y_stride * 2;
         new_cb += new_cb_stride;
         new_cr += new_cr_stride;
+        new_f  += new_f_stride;
     }
 
     ff_dlog(avctx, "Frame data: provided %d bytes, used %d bytes\n",
@@ -410,6 +446,7 @@ static int escape130_decode_frame(AVCodecContext *avctx, void *data,
     FFSWAP(uint8_t*, s->old_y, s->new_y);
     FFSWAP(uint8_t*, s->old_u, s->new_u);
     FFSWAP(uint8_t*, s->old_v, s->new_v);
+    FFSWAP(uint8_t*, s->old_f, s->new_f);
 
     *got_frame = 1;
 
