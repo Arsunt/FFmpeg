@@ -262,12 +262,14 @@ static int escape130_decode_frame(AVCodecContext *avctx, void *data,
                     y[i] = av_clip(y_avg + offset_table[difference_selector] *
                                    sign_table[sign_selector][i], 0, 63);
                 }
-            } else if (get_bits1(&gb)) {
+            } else {
                 if (get_bits1(&gb)) {
-                    y_avg = get_bits(&gb, 6);
-                } else {
-                    unsigned adjust_index = get_bits(&gb, 3);
-                    y_avg = (y_avg + luma_adjust[adjust_index]) & 63;
+                    if (get_bits1(&gb)) {
+                        y_avg = get_bits(&gb, 6);
+                    } else {
+                        unsigned adjust_index = get_bits(&gb, 3);
+                        y_avg = (y_avg + luma_adjust[adjust_index]) & 63;
+                    }
                 }
                 for (i = 0; i < 4; i++)
                     y[i] = y_avg;
