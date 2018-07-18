@@ -1,6 +1,7 @@
 /*
  * Escape 130 video decoder
  * Copyright (C) 2008 Eli Friedman (eli.friedman <at> gmail.com)
+ * Copyright (C) 2018 Michael Chaban (arsunt <at> gmail.com)
  *
  * This file is part of FFmpeg.
  *
@@ -37,6 +38,11 @@ typedef struct Escape130Context {
     uint8_t *buf1, *buf2;
     int     linesize[3];
 } Escape130Context;
+
+// Header flags definition
+#define MASK_VERSION    0x0000FFFF // must be 0x0130 for Escape130
+#define MASK_NONLINEAR  0x00010000 // non-linear chroma code flag
+#define MASK_KEYFRAME   0x80000000 // the keyframe flag
 
 static const uint8_t offset_table[] = { 2, 4, 10, 20 };
 static const int8_t sign_table[64][4] = {
@@ -113,10 +119,41 @@ static const uint8_t chroma_vals[] = {
     172, 180, 188, 196, 204, 212, 220, 228
 };
 
+static int16_t cb2rgb[2][32][3];
+static int16_t cr2rgb[2][32][3];
+
+/*
+ * Escape130 colorspace based on T-REC-T.871 formulas
+ * R = Y + 1.402 * V;
+ * G = G = Y - (0.114 * 1.772 * U + 0.299 * 1.402 * V) / 0.587;
+ * B = Y + 1.772 * U;
+ */
+static void generate_chroma2rgb(void)
+{
+    int i, mode, chroma;
+
+    // Perform calculation for both chroma tables: linear and non-linear.
+    // Linear table has wider range and it produces more contrast colors,
+    // but non-linear one is more accurate
+    for (mode = 0; mode < 2; ++mode) {
+        for (i = 0; i < 32; ++i) {
+            chroma = (mode ? chroma_vals[i] : (i << 3)) - 128;
+
+            cb2rgb[mode][i][0] = 0;
+            cb2rgb[mode][i][1] = (1000500 * 587 - 114 * 1772 * chroma) / 1000 / 587 - 1000;
+            cb2rgb[mode][i][2] = (1000500 + 1772 * chroma) / 1000 - 1000;
+
+            cr2rgb[mode][i][0] = (1000500 + 1402 * chroma) / 1000 - 1000;
+            cr2rgb[mode][i][1] = (1000500 * 587 - 299 * 1402 * chroma) / 1000 / 587 - 1000;
+            cr2rgb[mode][i][2] = 0;
+        }
+    }
+}
+
 static av_cold int escape130_decode_init(AVCodecContext *avctx)
 {
     Escape130Context *s = avctx->priv_data;
-    avctx->pix_fmt = AV_PIX_FMT_YUV420P;
+    avctx->pix_fmt = AV_PIX_FMT_RGB24;
 
     if ((avctx->width & 1) || (avctx->height & 1)) {
         av_log(avctx, AV_LOG_ERROR,
@@ -148,6 +185,8 @@ static av_cold int escape130_decode_init(AVCodecContext *avctx)
     memset(s->old_y, 0,    avctx->width * avctx->height);
     memset(s->old_u, 0x10, avctx->width * avctx->height / 4);
     memset(s->old_v, 0x10, avctx->width * avctx->height / 4);
+
+    generate_chroma2rgb();
 
     return 0;
 }
@@ -196,20 +235,21 @@ static int escape130_decode_frame(AVCodecContext *avctx, void *data,
     Escape130Context *s = avctx->priv_data;
     AVFrame *pic        = data;
     GetBitContext gb;
+    unsigned frame_flags, frame_size;
     int ret;
 
     uint8_t *old_y, *old_cb, *old_cr,
             *new_y, *new_cb, *new_cr;
-    uint8_t *dstY, *dstU, *dstV;
+    uint8_t *dst_line, *dst_rgb;
     unsigned old_y_stride, old_cb_stride, old_cr_stride,
              new_y_stride, new_cb_stride, new_cr_stride;
     unsigned total_blocks = avctx->width * avctx->height / 4,
              block_index, block_x = 0;
     unsigned y[4] = { 0 }, cb = 0x10, cr = 0x10;
-    int skip = -1, y_avg = 0, i, j;
+    int skip = -1, chroma_mode = 0, y_avg = 0, r, g, b, i, j, m, n;
     uint8_t *ya = s->old_y_avg;
 
-    // first 16 bytes are header; no useful information in here
+    // first 16 bytes are header
     if (buf_size <= 16) {
         av_log(avctx, AV_LOG_ERROR, "Insufficient frame data\n");
         return AVERROR_INVALIDDATA;
@@ -220,7 +260,23 @@ static int escape130_decode_frame(AVCodecContext *avctx, void *data,
 
     if ((ret = init_get_bits8(&gb, avpkt->data, avpkt->size)) < 0)
         return ret;
-    skip_bits_long(&gb, 16 * 8);
+
+    frame_flags = get_bits_long(&gb, 32);
+    if ((frame_flags & MASK_VERSION) != 0x0130) {
+        av_log(avctx, AV_LOG_ERROR, "Invalid frame header\n");
+        return AVERROR_INVALIDDATA;
+    }
+
+    frame_size  = get_bits_long(&gb, 32);
+    if (buf_size < frame_size) {
+        av_log(avctx, AV_LOG_ERROR, "Insufficient frame data\n");
+        return AVERROR_INVALIDDATA;
+    }
+
+    // the following 8 bytes were reserved and never used (filled with zeros)
+    skip_bits_long(&gb, 64);
+
+    chroma_mode = (frame_flags & MASK_NONLINEAR) ? 1 : 0;
 
     new_y  = s->new_y;
     new_cb = s->new_u;
@@ -318,22 +374,32 @@ static int escape130_decode_frame(AVCodecContext *avctx, void *data,
     new_y  = s->new_y;
     new_cb = s->new_u;
     new_cr = s->new_v;
-    dstY   = pic->data[0];
-    dstU   = pic->data[1];
-    dstV   = pic->data[2];
-    for (j = 0; j < avctx->height; j++) {
-        for (i = 0; i < avctx->width; i++)
-            dstY[i] = new_y[i] << 2;
-        dstY  += pic->linesize[0];
-        new_y += new_y_stride;
-    }
+    dst_line = pic->data[0];
+
     for (j = 0; j < avctx->height / 2; j++) {
         for (i = 0; i < avctx->width / 2; i++) {
-            dstU[i] = chroma_vals[new_cb[i]];
-            dstV[i] = chroma_vals[new_cr[i]];
+            for (m = 0; m < 2; m++) {
+                for (n = 0; n < 2; n++) {
+                    r = (new_y[i * 2 + m * new_y_stride + n] << 2) +
+                        cb2rgb[chroma_mode][new_cb[i]][0] +
+                        cr2rgb[chroma_mode][new_cr[i]][0];
+                    g = (new_y[i * 2 + m * new_y_stride + n] << 2) +
+                        cb2rgb[chroma_mode][new_cb[i]][1] +
+                        cr2rgb[chroma_mode][new_cr[i]][1];
+                    b = (new_y[i * 2 + m * new_y_stride + n] << 2) +
+                        cb2rgb[chroma_mode][new_cb[i]][2] +
+                        cr2rgb[chroma_mode][new_cr[i]][2];
+
+                    dst_rgb = dst_line + i * 6 + m * pic->linesize[0] + n * 3;
+
+                    dst_rgb[0] = av_clip(r, 0, 255);
+                    dst_rgb[1] = av_clip(g, 0, 255);
+                    dst_rgb[2] = av_clip(b, 0, 255);
+                }
+            }
         }
-        dstU   += pic->linesize[1];
-        dstV   += pic->linesize[2];
+        dst_line += pic->linesize[0] * 2;
+        new_y  += new_y_stride * 2;
         new_cb += new_cb_stride;
         new_cr += new_cr_stride;
     }
